@@ -609,6 +609,9 @@ struct HomeFeedContent: View {
 
     /// Apply the gap collapse: animate content upward, fire compensator for users below the gap.
     private func applyGapCollapse(_ collapsePx: CGFloat) {
+        // Skip if already at this offset (re-evaluation after suppression window with stable gap).
+        guard abs(collapsePx - gapCollapseOffset) > 2 else { return }
+
         let tabContentY = homeHeaderHeight + homeTabRowHeight
         gapCollapseTabContentY = tabContentY
         gapCollapsedAt = Date.now

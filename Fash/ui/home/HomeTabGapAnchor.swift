@@ -44,15 +44,18 @@ enum HomeGapCategory: Equatable {
 enum HomeTabGapClassifier {
     /// Maximum gap considered "normal" between tab bar bottom and first product card.
     /// feedBodyContent has .padding(.top, spacing.spacing2 ≈ 8pt) + LazyVStack spacing before
-    /// the first chunk (≈ 8pt for widthProbe→chunk0 spacing). Total expected ≈ 16–28pt.
-    static let normalMaxGapPts: CGFloat = 36
+    /// the first chunk (≈ 8pt for widthProbe→chunk0 spacing). Total expected ≈ 16–20pt.
+    static let normalMaxGapPts: CGFloat = 20
 
-    /// Excess above normal required before we classify as abnormal.
-    /// Prevents false positives from minor layout fluctuations.
-    static let abnormalThresholdPts: CGFloat = 72
+    /// Gap must exceed this above normalMaxGapPts to trigger collapse.
+    /// Prevents false positives from minor layout fluctuations (≈ 1 tile row = 44pt).
+    /// Total minimum trigger gap = normalMaxGapPts + abnormalThresholdPts = 44pt.
+    static let abnormalThresholdPts: CGFloat = 24
 
     /// After a feed mutation, wait this long for layout to settle before evaluating.
-    static let mutationGracePeriod: TimeInterval = 0.65
+    /// Must be shorter than the scheduleGapEvaluation debounce (650ms) so the grace
+    /// period is always expired when evaluation fires.
+    static let mutationGracePeriod: TimeInterval = 0.38
 
     /// After applying a collapse, suppress re-evaluation for this long to break potential loops.
     static let postCollapseSuppressionPeriod: TimeInterval = 3.0
@@ -68,8 +71,7 @@ enum HomeTabGapClassifier {
         guard viewportGap < .greatestFiniteMagnitude / 2, viewportGap > -500 else { return .normal }
         guard context.itemCount > 0 else { return .normal }
 
-        // Compute how much excess there is beyond expected spacing.
-        // Subtract already-applied collapse to avoid double-counting.
+        // Compute total apparent gap, adding back already-applied collapse to avoid double-counting.
         let apparent = viewportGap + context.currentCollapseOffset
         let excess = apparent - normalMaxGapPts
         guard excess > abnormalThresholdPts else { return .normal }
@@ -85,7 +87,8 @@ enum HomeTabGapClassifier {
             return .masonryReconstructing
         }
 
-        let collapsePx = min(excess - abnormalThresholdPts / 2, maxCollapsePts)
+        // Collapse fully to normalMaxGapPts so no residual gap remains to re-trigger.
+        let collapsePx = min(apparent - normalMaxGapPts, maxCollapsePts)
         return collapsePx > 4 ? .abnormal(collapsePx: collapsePx) : .normal
     }
 }
