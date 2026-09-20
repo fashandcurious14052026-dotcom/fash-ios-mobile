@@ -105,7 +105,7 @@ struct ProfileCollapsingScrollLayout<ExpandedHeader: View, CompactHeader: View>:
     var additionalBottomInset: CGFloat = 0
     /// Legacy flag — profile grid always uses hoisted chunked masonry rows in `LazyVStack`.
     var useStaggeredMasonryGrid: Bool = false
-    /// When true, hoists one [FeedMasonryChunkedGrid] (Home-style continuous masonry) instead of tiny lazy rows.
+    /// When true, hoists one continuous masonry (eager column layout) instead of tiny lazy rows.
     var masonryEagerLayout: Bool = false
     /// Skeleton grid (Explore-style) while the first page loads.
     var showGridLoading: Bool = false

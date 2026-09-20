@@ -282,10 +282,6 @@ struct HomeFeedScrollCoordinator: UIViewRepresentable {
     var scrollToTopToken: Int = 0
     var homeHeaderHeight: CGFloat = 0
     var homeTabRowHeight: CGFloat = 48
-    /// Current item count — used by the blank-top safety check.
-    var itemCount: Int = 0
-    /// Fired when items exist but the scroll content appears blank after scrolling to top.
-    var onBlankTopDetected: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(boundary: scrollBoundary) }
 
@@ -300,8 +296,6 @@ struct HomeFeedScrollCoordinator: UIViewRepresentable {
         coordinator.boundary = scrollBoundary
         coordinator.homeHeaderHeight = homeHeaderHeight
         coordinator.homeTabRowHeight = homeTabRowHeight
-        coordinator.itemCount = itemCount
-        coordinator.onBlankTopDetected = onBlankTopDetected
         uiView.coordinator = coordinator
         coordinator.installIfNeeded(from: uiView)
         scrollBoundary.updateHomeStickyTabsVisibility(
@@ -320,8 +314,6 @@ struct HomeFeedScrollCoordinator: UIViewRepresentable {
         var homeHeaderHeight: CGFloat = 0
         var homeTabRowHeight: CGFloat = 48
         var lastScrollToTopToken = 0
-        var itemCount = 0
-        var onBlankTopDetected: (() -> Void)?
         weak var scrollView: UIScrollView?
         private var offsetObservation: NSKeyValueObservation?
         private var lastContentOffsetY: CGFloat?
@@ -394,24 +386,6 @@ struct HomeFeedScrollCoordinator: UIViewRepresentable {
                     headerHeight: homeHeaderHeight,
                     tabRowHeight: homeTabRowHeight
                 )
-                // Blank-top safety net: PinnedTabScrollOffsetFixer retries for 600ms total.
-                // Check at 750ms — two signals indicate a blank top:
-                //   1. scroll ended up more than 50pt below the true top (compensator pushed it down)
-                //   2. contentSize is unreasonably small for the item count (masonry didn't render)
-                // Either signal triggers a full tab reload to clear the stuck state.
-                let capturedItemCount = itemCount
-                let capturedCallback = onBlankTopDetected
-                guard capturedItemCount > 5, capturedCallback != nil else { return }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self, weak scrollView] in
-                    guard let self, let scrollView else { return }
-                    guard !self.boundary.isUserInteracting else { return }
-                    guard capturedItemCount > 5 else { return }
-                    let minY = -scrollView.adjustedContentInset.top
-                    let scrollNotAtTop = scrollView.contentOffset.y > minY + 50
-                    let contentTooSmall = scrollView.contentSize.height < max(400, scrollView.bounds.height * 0.8)
-                    guard scrollNotAtTop || contentTooSmall else { return }
-                    capturedCallback?()
-                }
             }
         }
     }

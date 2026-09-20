@@ -17,6 +17,9 @@ struct HomeFeedContent: View {
     var onInReviewJourneyClick: () -> Void = {}
     var onExploreShortcutClick: (HomeExploreShortcut) -> Void = { _ in }
 
+    /// Named coordinate space of the Home `ScrollView` — the masonry derives its render window from it.
+    private static let scrollSpace = "homeFeedScroll"
+
     private var tabs: [HomeFeedTab] {
         viewModel.orderedTabs(isGuestMode: isGuestMode)
     }
@@ -63,25 +66,7 @@ struct HomeFeedContent: View {
     @State private var homeScrollBoundary = HomeFeedScrollBoundary()
     @State private var homeHeaderHeight: CGFloat = 0
     @State private var homeTabRowHeight: CGFloat = 48
-    @State private var homeScrollClampRevision = 0
     @State private var listingInteractionEnabled = true
-    @State private var masonryColumnAssignmentsByTab: [String: [String: Bool]] = [:]
-
-    // MARK: Tab gap anchor state
-    /// Non-reactive measurements container — updated from onPreferenceChange without triggering redraws.
-    @State private var gapMeasurements = HomeGapMeasurements()
-    /// Negative top padding applied to feedBodyContent to collapse abnormal whitespace.
-    @State private var gapCollapseOffset: CGFloat = 0
-    /// Token that fires HomeTabGapCollapseCompensator for users scrolled below the gap.
-    @State private var gapCollapseToken: Int = 0
-    /// Content-space Y of tab bar bottom — passed to compensator.
-    @State private var gapCollapseTabContentY: CGFloat = 0
-    /// When the gap collapse was last applied — prevents re-evaluation loops.
-    @State private var gapCollapsedAt: Date = .distantPast
-    /// When the feed last mutated (trim / restore / item count change).
-    @State private var lastFeedMutationAt: Date = .distantPast
-    /// Debounce task for scheduled gap evaluation.
-    @State private var gapEvalTask: Task<Void, Never>? = nil
 
     private var pinnedChromeHeight: CGFloat {
         max(0, homeHeaderHeight + homeTabRowHeight)
@@ -91,20 +76,6 @@ struct HomeFeedContent: View {
         homeScrollBoundary.updateHomeStickyTabsVisibility(
             headerHeight: homeHeaderHeight,
             tabRowHeight: homeTabRowHeight
-        )
-    }
-
-    private var masonryColumnWidth: CGFloat {
-        ListingMasonryGrid.feedGridColumnWidth(
-            containerWidth: UIScreen.main.bounds.width,
-            spacing: spacing
-        )
-    }
-
-    private var masonryColumnAssignments: Binding<[String: Bool]> {
-        Binding(
-            get: { masonryColumnAssignmentsByTab[viewModel.selectedFeedTabKey] ?? [:] },
-            set: { masonryColumnAssignmentsByTab[viewModel.selectedFeedTabKey] = $0 }
         )
     }
 
@@ -126,10 +97,6 @@ struct HomeFeedContent: View {
                                 .id(HomeScrollIds.feedContent)
                                 .allowsHitTesting(listingInteractionEnabled)
                                 .frame(minHeight: homeFeedMinHeight, alignment: .top)
-                                // Gap collapse: negative padding draws cards closer to tabs.
-                                // Animated via withAnimation in applyGapCollapse(_:).
-                                // Reset to 0 on tab change / refresh / items cleared.
-                                .padding(.top, -gapCollapseOffset)
                         }
                         .padding(.bottom, promoDockInset + spacing.spacing2)
                         .fashScrollViewTabSwipe(
@@ -148,7 +115,6 @@ struct HomeFeedContent: View {
                             PinnedTabScrollOffsetFixer(
                                 resetToken: 0,
                                 trueTopToken: viewModel.homeScrollToTopToken,
-                                clampRevision: homeScrollClampRevision,
                                 headerHeight: pinnedChromeHeight,
                                 suspendDuringPull: viewModel.isRefreshing
                             )
@@ -156,33 +122,11 @@ struct HomeFeedContent: View {
                                 scrollBoundary: homeScrollBoundary,
                                 scrollToTopToken: viewModel.homeScrollToTopToken,
                                 homeHeaderHeight: homeHeaderHeight,
-                                homeTabRowHeight: homeTabRowHeight,
-                                itemCount: viewModel.items.count,
-                                onBlankTopDetected: {
-                                    // Blank detected at top after scroll settled — reload the tab
-                                    // from the API to clear any stuck scroll/layout state.
-                                    viewModel.retryTab(
-                                        viewModel.selectedFeedTab,
-                                        deps: deps,
-                                        isGuestMode: isGuestMode
-                                    )
-                                }
-                            )
-                            FeedScrollTrimCompensator(
-                                token: viewModel.homeFeedTrimToken,
-                                signedDeltaY: viewModel.homeFeedTrimSignedDeltaY,
-                                suppressUntil: viewModel.homeFeedCompensatorSuppressedUntil
-                            )
-                            // Compensates scroll offset after gap collapse so users below the
-                            // gap region don't experience a visual jump.
-                            HomeTabGapCollapseCompensator(
-                                token: gapCollapseToken,
-                                signedDeltaY: -gapCollapseOffset,
-                                tabBottomContentY: gapCollapseTabContentY
+                                homeTabRowHeight: homeTabRowHeight
                             )
                         }
                     }
-                    .coordinateSpace(name: "homeFeedScroll")
+                    .coordinateSpace(name: Self.scrollSpace)
 
                     if homeScrollBoundary.stickyTabsVisible {
                         homeFeedTabsBar(sticky: true)
@@ -194,15 +138,6 @@ struct HomeFeedContent: View {
                     guard height > 1, abs(height - homeTabRowHeight) > 0.5 else { return }
                     homeTabRowHeight = height
                     refreshHomeStickyTabs()
-                }
-                // Gap anchor: update measurements without triggering SwiftUI redraws.
-                // Both keys fire on every scroll frame; storing into a class property avoids
-                // view invalidation while keeping values accessible in evaluateGap().
-                .onPreferenceChange(HomeTabRowMinYKey.self) { minY in
-                    gapMeasurements.tabRowMinY = minY
-                }
-                .onPreferenceChange(HomeFeedFirstContentMinYKey.self) { minY in
-                    gapMeasurements.firstContentMinY = minY
                 }
                 .animation(FashMotion.tabContent, value: homeScrollBoundary.stickyTabsVisible)
                 .fashFeedPullRefresh(isRefreshing: $viewModel.isRefreshing) {
@@ -216,33 +151,7 @@ struct HomeFeedContent: View {
                 }
                 .onChange(of: viewModel.selectedFeedTabKey) { oldKey, newKey in
                     guard oldKey != newKey else { return }
-                    resetGapCollapse()
                     onHomeFeedTabChanged(to: newKey)
-                }
-                .onChange(of: viewModel.items.count) { oldCount, newCount in
-                    if viewModel.selectedFeedTab == .following {
-                        if newCount < oldCount, !viewModel.isRefreshing {
-                            homeScrollClampRevision += 1
-                        }
-                    }
-                    // Reset collapse when items are cleared; schedule evaluation on mutation.
-                    if newCount == 0 {
-                        resetGapCollapse()
-                    } else if oldCount != newCount {
-                        lastFeedMutationAt = Date.now
-                        scheduleGapEvaluation()
-                    }
-                }
-                .onChange(of: viewModel.homeFeedTrimToken) { _, _ in
-                    lastFeedMutationAt = Date.now
-                    scheduleGapEvaluation()
-                }
-                .onChange(of: viewModel.homeFeedRepaintToken) { _, _ in
-                    lastFeedMutationAt = Date.now
-                    scheduleGapEvaluation()
-                }
-                .onChange(of: viewModel.isRefreshing) { _, refreshing in
-                    if refreshing { resetGapCollapse() }
                 }
             }
 
@@ -407,15 +316,9 @@ struct HomeFeedContent: View {
                 .frame(maxWidth: .infinity, minHeight: 320)
         } else {
             VStack(spacing: 0) {
-                FeedMasonryChunkedGrid(
+                FeedMasonryWindowedGrid(
                     items: viewModel.items,
-                    columnAssignments: masonryColumnAssignments,
-                    isLoadingTop: viewModel.homeFeedTopLoading,
-                    repaintToken: viewModel.homeFeedRepaintToken,
-                    onGapDetected: { gaps in
-                        viewModel.onFeedLayoutGapDetected(gaps)
-                    },
-                    coordinateSpaceForFirstContent: "homeFeedScroll",
+                    coordinateSpace: Self.scrollSpace,
                     footer: {
                         let tab = viewModel.selectedFeedTab
                         if viewModel.hasMore(for: tab) || viewModel.isLoadingMore(for: tab) {
@@ -434,95 +337,81 @@ struct HomeFeedContent: View {
                         }
                     },
                     cell: { item, index in
-                    HomeFeedListingCell(
-                        item: item,
-                        index: index,
-                        surface: analyticsSurface,
-                        imageAspectRatio: ListingMasonryGrid.masonryAspectRatio(for: item),
-                        onPrefetchLoadMore: {
-                            let tab = viewModel.selectedFeedTab
-                            if tab == .following {
-                                viewModel.scheduleFollowingWindowTrim(
-                                    visibleIndex: index,
-                                    columnWidth: masonryColumnWidth,
-                                    columnAssignments: masonryColumnAssignmentsByTab[tab.rawValue] ?? [:]
-                                )
-                            } else {
-                                viewModel.scheduleSectionTabTrim(
-                                    visibleIndex: index,
-                                    columnWidth: masonryColumnWidth,
-                                    columnAssignments: masonryColumnAssignmentsByTab[tab.rawValue] ?? [:]
-                                )
-                            }
-                            if FeedPaginationPolicy.shouldPrefetchNextPage(
-                                appearedIndex: index,
-                                totalCount: viewModel.items.count
-                            ) {
-                                viewModel.loadMore(
-                                    deps: deps,
-                                    isGuestMode: isGuestMode,
-                                    fromScrollEdge: false
-                                )
-                            }
-                        },
-                        onTap: {
-                            viewModel.reportListingClick(
-                                item: item,
-                                surface: analyticsSurface,
-                                position: index,
-                                deps: deps
-                            )
-                            deps.presentListingPreview(
-                                item: item,
-                                router: router,
-                                publicBrowse: isGuestMode,
-                                surface: analyticsSurface,
-                                position: index
-                            )
-                        },
-                        onLike: {
-                            if isGuestMode {
-                                onRequestSignIn(L10n.guestLoginReasonLike)
-                            } else {
-                                viewModel.toggleLike(
-                                    item,
+                        HomeFeedListingCell(
+                            item: item,
+                            index: index,
+                            surface: analyticsSurface,
+                            imageAspectRatio: ListingMasonryGrid.masonryAspectRatio(for: item),
+                            onPrefetchLoadMore: {
+                                if FeedPaginationPolicy.shouldPrefetchNextPage(
+                                    appearedIndex: index,
+                                    totalCount: viewModel.items.count
+                                ) {
+                                    viewModel.loadMore(
+                                        deps: deps,
+                                        isGuestMode: isGuestMode,
+                                        fromScrollEdge: false
+                                    )
+                                }
+                            },
+                            onTap: {
+                                viewModel.reportListingClick(
+                                    item: item,
                                     surface: analyticsSurface,
                                     position: index,
                                     deps: deps
                                 )
-                            }
-                        },
-                        onSave: {
-                            if isGuestMode {
-                                onRequestSignIn(L10n.guestLoginReasonSaved)
-                            } else {
-                                viewModel.toggleSave(
-                                    item,
+                                deps.presentListingPreview(
+                                    item: item,
+                                    router: router,
+                                    publicBrowse: isGuestMode,
+                                    surface: analyticsSurface,
+                                    position: index
+                                )
+                            },
+                            onLike: {
+                                if isGuestMode {
+                                    onRequestSignIn(L10n.guestLoginReasonLike)
+                                } else {
+                                    viewModel.toggleLike(
+                                        item,
+                                        surface: analyticsSurface,
+                                        position: index,
+                                        deps: deps
+                                    )
+                                }
+                            },
+                            onSave: {
+                                if isGuestMode {
+                                    onRequestSignIn(L10n.guestLoginReasonSaved)
+                                } else {
+                                    viewModel.toggleSave(
+                                        item,
+                                        surface: analyticsSurface,
+                                        position: index,
+                                        deps: deps,
+                                        isGuestMode: isGuestMode
+                                    )
+                                }
+                            },
+                            onRecordView: {
+                                viewModel.recordView(
+                                    item: item,
+                                    position: index,
+                                    surface: analyticsSurface,
+                                    deps: deps
+                                )
+                            },
+                            onDwell: { dwellMs in
+                                viewModel.recordDwell(
+                                    item: item,
                                     surface: analyticsSurface,
                                     position: index,
-                                    deps: deps,
-                                    isGuestMode: isGuestMode
+                                    dwellMs: dwellMs,
+                                    deps: deps
                                 )
                             }
-                        },
-                        onRecordView: {
-                            viewModel.recordView(
-                                item: item,
-                                position: index,
-                                surface: analyticsSurface,
-                                deps: deps
-                            )
-                        },
-                        onDwell: { dwellMs in
-                            viewModel.recordDwell(
-                                item: item,
-                                surface: analyticsSurface,
-                                position: index,
-                                dwellMs: dwellMs,
-                                deps: deps
-                            )
-                        }
-                    )
+                        )
                     }
                 )
 
@@ -532,6 +421,7 @@ struct HomeFeedContent: View {
             }
             .padding(.top, spacing.spacing2)
             .padding(.bottom, spacing.spacing4)
+            // Per-tab identity: each tab owns its own layout store and render window.
             .id(viewModel.selectedFeedTabKey)
         }
     }
@@ -559,78 +449,6 @@ struct HomeFeedContent: View {
 
     private func applyHomeScrollToFeedTop(using scrollProxy: ScrollViewProxy) {
         HomeFeedScrollReset.scheduleScrollToFeedTop(proxy: scrollProxy)
-    }
-
-    // MARK: - Tab Gap Anchor
-
-    /// Schedule a gap evaluation with a debounce delay to let the layout settle.
-    private func scheduleGapEvaluation(delayMs: Int = 650) {
-        gapEvalTask?.cancel()
-        gapEvalTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(delayMs))
-            guard !Task.isCancelled else { return }
-            evaluateGap()
-        }
-    }
-
-    /// Read current gap measurements and classify. Apply collapse if abnormal.
-    private func evaluateGap() {
-        // Only evaluate when the in-scroll tab bar is at or near the visible top.
-        // If tabRowMinY is deeply negative the user is scrolled past the tabs,
-        // meaning no visible gap exists and evaluation would produce false positives.
-        let tabMinY = gapMeasurements.tabRowMinY
-        guard tabMinY > -(homeTabRowHeight + 40) else { return }
-
-        let viewportGap = gapMeasurements.contentSpaceGap(tabRowHeight: homeTabRowHeight)
-        let context = HomeGapFeedContext(
-            isLoading: viewModel.isShellLoading || viewModel.isTabLoading(viewModel.selectedFeedTab),
-            isRefreshing: viewModel.isRefreshing,
-            isUserInteracting: homeScrollBoundary.isUserInteracting,
-            itemCount: viewModel.items.count,
-            timeSinceLastMutation: Date.now.timeIntervalSince(lastFeedMutationAt),
-            timeSinceLastCollapse: Date.now.timeIntervalSince(gapCollapsedAt),
-            currentCollapseOffset: gapCollapseOffset
-        )
-
-        let category = HomeTabGapClassifier.classify(viewportGap: viewportGap, context: context)
-        FeedPerformance.log("[HomeTabGap] gap=\(String(format: "%.1f", viewportGap)) state=\(category)")
-
-        switch category {
-        case .normal:
-            break
-        case .loading:
-            break
-        case .masonryReconstructing:
-            scheduleGapEvaluation(delayMs: 500)
-        case .abnormal(let collapsePx):
-            applyGapCollapse(collapsePx)
-        }
-    }
-
-    /// Apply the gap collapse: animate content upward, fire compensator for users below the gap.
-    private func applyGapCollapse(_ collapsePx: CGFloat) {
-        // Skip if already at this offset (re-evaluation after suppression window with stable gap).
-        guard abs(collapsePx - gapCollapseOffset) > 2 else { return }
-
-        let tabContentY = homeHeaderHeight + homeTabRowHeight
-        gapCollapseTabContentY = tabContentY
-        gapCollapsedAt = Date.now
-
-        // Fire compensator BEFORE animation so users below the gap see no jump.
-        gapCollapseToken &+= 1
-
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-            gapCollapseOffset = collapsePx
-        }
-        FeedPerformance.log("[HomeTabGap] Collapsed \(String(format: "%.1f", collapsePx))pt tabContentY=\(String(format: "%.1f", tabContentY))")
-    }
-
-    /// Reset gap collapse immediately — called on tab change, refresh, and items cleared.
-    private func resetGapCollapse() {
-        gapEvalTask?.cancel()
-        guard gapCollapseOffset > 0 else { return }
-        gapCollapseOffset = 0
-        gapCollapseToken = 0
     }
 }
 

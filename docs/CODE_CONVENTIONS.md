@@ -115,6 +115,7 @@ private func section(...) -> AnyView { ... return AnyView(VStack { ... }) }
 ### Scroll / masonry
 
 - Trong `ScrollView` + `LazyVStack`: dùng `ListingMasonryLazyRows`, **không** nested `LazyVStack` cột
+- Home feed: dùng `FeedMasonryWindowedGrid` (logical feed không bao giờ trim, không scroll compensation) — xem [HOME_FEED_MASONRY.md](./HOME_FEED_MASONRY.md)
 - Footer listing: không `frame(height:)` cố định cắt text
 
 ### iOS 17 APIs

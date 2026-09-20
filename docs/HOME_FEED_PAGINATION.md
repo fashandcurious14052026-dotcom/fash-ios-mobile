@@ -1,6 +1,7 @@
-# Home Feed — Cursor Pagination + Sliding Window
+# Home Feed — Cursor Pagination
 
 TikTok-style infinite scroll for tab **Following** (`GET /listings/home`).
+Masonry rendering / windowing is documented in [HOME_FEED_MASONRY.md](./HOME_FEED_MASONRY.md).
 
 ## Backend (core-service)
 
@@ -27,17 +28,19 @@ Response:
 | Layer | Responsibility |
 |-------|----------------|
 | `ListingRepository.getHomeFeedPage` | Cursor API |
-| `FeedSlidingWindow` | Max 80 items in RAM; trim front when index > buffer |
-| `HomeFeedScrollCoordinator` | Scroll delta after trim; preserve on append near bottom |
+| `FeedGlobalItemStore` | Append-only, deduplicated logical feed per tab (never trimmed) |
+| `FeedMasonryWindowedGrid` | Renders only the placements inside the viewport band |
+| `HomeFeedScrollCoordinator` | Sticky tab chrome + `allowsFollowingLoadMore` gating |
 | `HomeViewModel` | Single `isLoadingMoreFollowing` guard; append-only |
 
-### Sliding window
+### Memory
 
-- `bufferBefore = 30`, `bufferAfter = 30`, `maxItems = 80`
-- Trim only when visible index ≥ 38 and count > 80
-- UIKit adjusts `contentOffset.y -= estimatedRemovedHeight` (no top gap)
+Items are structs of a few hundred bytes; 3000 rows ≈ 1 MB. Decoded images are owned by the
+Kingfisher cache (bounded, memory-warning aware) and only the ~40–80 windowed cells hold a live
+`KFImage`. There is no item-array trimming.
 
 ### Prefetch
 
-- Tile `onAppear` when `index > count - 10` (Explore policy)
-- Footer = spinner only (`triggersLoadOnAppear: false`)
+- Cell `onAppear` when `index >= count - 8` (`FeedPaginationPolicy`)
+- Footer sentinel (`FeedLoadMoreFooter`) is in the hierarchy only while the render window reaches the
+  end of the grid; one load per footer visit

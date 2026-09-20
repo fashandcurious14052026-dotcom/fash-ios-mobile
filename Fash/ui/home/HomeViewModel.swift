@@ -9,76 +9,35 @@ private enum HomeFeedConstants {
     static let staleThreshold: TimeInterval = 60
 }
 
+/// Per-tab **logical feed**: every item loaded for the tab this session, append-only and deduplicated.
+/// The feed is never trimmed — rendering is windowed by `FeedMasonryWindowedGrid`, and a
+/// `ListingFeedItem` is a few hundred bytes, so thousands of rows are negligible next to one image.
 private struct HomeTabFeedState {
     var hasMore = false
     var isLoadingMore = false
-    private(set) var window = FeedSlidingWindow()
-    private(set) var globalStore = FeedGlobalItemStore()
+    private(set) var store = FeedGlobalItemStore()
     private var knownIds: Set<String> = []
 
-    var items: [ListingFeedItem] { window.items }
+    var items: [ListingFeedItem] { store.allItems }
 
-    /// Logical offset for API pagination — always equals total items ever loaded for this tab.
-    var loadMoreOffset: Int { globalStore.isEmpty ? window.logicalStartIndex + window.items.count : globalStore.count }
+    /// Offset for API pagination — total items ever loaded for this tab.
+    var loadMoreOffset: Int { store.count }
 
     mutating func setFirstPage(_ loaded: [ListingFeedItem]) {
-        knownIds = globalStore.reset(with: loaded)
-        window.reset(with: loaded)
+        knownIds = store.reset(with: loaded)
     }
 
     @discardableResult
     mutating func appendUniquePage(_ page: [ListingFeedItem]) -> Int {
-        let before = globalStore.count
-        globalStore.appendNew(page, knownIds: &knownIds)
-        let freshItems = globalStore.items(from: before, to: globalStore.count)
-        if !freshItems.isEmpty { window.appendKnownFresh(freshItems) }
-        return freshItems.count
-    }
-
-    mutating func trimFront(
-        visibleIndex: Int,
-        columnWidth: CGFloat,
-        columnAssignments: [String: Bool],
-        policy: FeedSlidingWindowPolicy
-    ) -> FeedSlidingWindow.TrimResult? {
-        window.trimFrontIfNeeded(
-            visibleIndex: visibleIndex,
-            columnWidth: columnWidth,
-            policy: policy,
-            columnAssignments: columnAssignments
-        )
-    }
-
-    @discardableResult
-    mutating func trimBack(count: Int) -> Int {
-        window.trimBack(count: count)
-    }
-
-    /// Restore evicted items from the global store when the user scrolls back up.
-    mutating func restoreFromGlobal(
-        targetGlobalStart: Int,
-        columnWidth: CGFloat,
-        columnAssignments: [String: Bool]
-    ) -> FeedSlidingWindow.PrependResult? {
-        let currentStart = window.logicalStartIndex
-        guard currentStart > 0, targetGlobalStart < currentStart else { return nil }
-        let toRestore = globalStore.items(from: max(0, targetGlobalStart), to: currentStart)
-        guard !toRestore.isEmpty else { return nil }
-        let deltaY = FeedSlidingWindow.exactMasonryHeight(
-            items: toRestore, columnWidth: columnWidth, columnAssignments: columnAssignments
-        )
-        window.restoreFront(toRestore)
-        return FeedSlidingWindow.PrependResult(addedCount: toRestore.count, scrollDeltaY: deltaY)
+        store.appendNew(page, knownIds: &knownIds)
     }
 
     @discardableResult
     mutating func patchItem(withId id: String, transform: (ListingFeedItem) -> ListingFeedItem) -> Bool {
-        let patched = window.patchItem(withId: id, transform: transform)
-        globalStore.patchItem(withId: id, transform: transform)
-        return patched
+        store.patchItem(withId: id, transform: transform)
     }
 
-    var isEmpty: Bool { window.items.isEmpty }
+    var isEmpty: Bool { store.isEmpty }
 }
 
 @Observable
@@ -110,21 +69,12 @@ final class HomeViewModel {
     private(set) var homeScrollToFeedTopToken = 0
     private(set) var homePinnedScrollResetToken = 0
     private(set) var homeTabBarScrollToken = 0
-    var homeFeedTrimToken = 0
-    private(set) var homeFeedTrimSignedDeltaY: CGFloat = 0
-    /// True while top-of-window content is being loaded; drives the grid's top loading spinner.
-    var homeFeedTopLoading = false
-    /// Incremented when blank-top detection fires — forces the masonry grid to relayout from scratch.
-    var homeFeedRepaintToken = 0
-    /// Non-nil during the tap-to-top suppression window — tells FeedScrollTrimCompensator to skip.
-    var homeFeedCompensatorSuppressedUntil: Date? = nil
-    /// Last column width passed to scheduleSectionTabTrim — used for immediate scroll-to-top restore.
-    private var lastKnownFeedColumnWidth: CGFloat = 160
 
     var dailyOutfitDrop: [OutfitSetCard] { sections.dailyOutfitDrop }
 
     private var sections = HomeRecommendationSections()
-    private var followingWindow = FeedSlidingWindow()
+    /// Following tab logical feed — append-only, cursor paginated, never trimmed.
+    private var followingStore = FeedGlobalItemStore()
     private var followingItemIds = Set<String>()
     private var followingNextCursor: String?
     private var loadedTabs: Set<String> = []
@@ -139,8 +89,6 @@ final class HomeViewModel {
     private var sectionTabLoadMoreAt: [String: Date] = [:]
     private var sectionTabRateLimitUntil: [String: Date] = [:]
     private var followingDuplicatePageCount = 0
-    private var followingTrimTask: Task<Void, Never>?
-    private var sectionTabTrimTask: Task<Void, Never>?
     private var tabFeedState: [String: HomeTabFeedState] = [:]
     private var sectionLoadMoreTasks: [String: Task<Void, Never>] = [:]
 
@@ -196,82 +144,11 @@ final class HomeViewModel {
         loadMoreSectionTab(tab, deps: deps, isGuestMode: isGuestMode)
     }
 
-    /// Following tab only — idle window trim for memory (no pagination trigger).
-    func scheduleFollowingWindowTrim(visibleIndex: Int, columnWidth: CGFloat, columnAssignments: [String: Bool] = [:]) {
-        guard selectedFeedTab == .following else { return }
-        scheduleFollowingWindowTrimDeferred(visibleIndex: visibleIndex, columnWidth: columnWidth, columnAssignments: columnAssignments)
-    }
-
-    /// Section tabs (huntToday, forYou, etc.) — adaptive sliding window with scroll-back recovery.
-    func scheduleSectionTabTrim(visibleIndex: Int, columnWidth: CGFloat, columnAssignments: [String: Bool] = [:]) {
-        lastKnownFeedColumnWidth = columnWidth
-        let tab = selectedFeedTab
-        guard tab != .following else { return }
-        sectionTabTrimTask?.cancel()
-        sectionTabTrimTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(320))
-            guard !Task.isCancelled else { return }
-            guard selectedFeedTab == tab else { return }
-            guard let boundary = homeScrollBoundary, !boundary.isUserInteracting else { return }
-            let assignments = columnAssignments
-            let policy = adaptiveSectionTabPolicy(columnWidth: columnWidth)
-            var state = tabFeedState[tab.rawValue] ?? HomeTabFeedState()
-
-            // Scroll-back: restore evicted items when near the window boundary.
-            if visibleIndex <= policy.backfillVisibleThreshold && state.window.logicalStartIndex > 0 {
-                let targetStart = max(0, state.window.logicalStartIndex - policy.bufferBefore)
-
-                // Show top loading indicator; give SwiftUI one frame to render it before content changes.
-                homeFeedTopLoading = true
-                try? await Task.sleep(for: .milliseconds(16))
-                guard !Task.isCancelled, selectedFeedTab == tab else { homeFeedTopLoading = false; return }
-
-                if let restore = state.restoreFromGlobal(
-                    targetGlobalStart: targetStart,
-                    columnWidth: columnWidth,
-                    columnAssignments: assignments
-                ) {
-                    // Bidirectional window: trim same count from tail as prepended at head.
-                    state.trimBack(count: restore.addedCount)
-                    tabFeedState[tab.rawValue] = state
-                    syncItemsForSelectedTab()
-                    // Compensate scroll: prepending content above shifts the viewport.
-                    // The safety guard in applyCompensationNow skips this when already at/near top.
-                    homeFeedTrimSignedDeltaY = restore.scrollDeltaY
-                    homeFeedTrimToken += 1
-                    FeedPerformance.log(
-                        "Home \(tab) restore +\(restore.addedCount) trim-back window=\(state.items.count) start=\(state.window.logicalStartIndex)"
-                    )
-                }
-
-                // Brief hold so loading indicator is visible, then dismiss.
-                try? await Task.sleep(for: .milliseconds(80))
-                homeFeedTopLoading = false
-                return
-            }
-
-            // Forward scroll: trim items far above the viewport.
-            guard let trim = state.trimFront(
-                visibleIndex: visibleIndex,
-                columnWidth: columnWidth,
-                columnAssignments: assignments,
-                policy: policy
-            ) else { return }
-            tabFeedState[tab.rawValue] = state
-            syncItemsForSelectedTab()
-            homeFeedTrimSignedDeltaY = -trim.scrollDeltaY
-            homeFeedTrimToken += 1
-            FeedPerformance.log(
-                "Home \(tab) trim -\(trim.removedCount) window=\(state.items.count) offset=\(state.loadMoreOffset)"
-            )
-        }
-    }
-
-    /// Called when the OS issues a memory warning — flush non-visible image cache entries.
+    /// Called when the OS issues a memory warning — diagnostics only; decoded images live in the
+    /// Kingfisher cache, which already responds to memory pressure.
     func handleMemoryWarning() {
         let tab = selectedFeedTab
-        let visibleCount = tabFeedState[tab.rawValue]?.items.count ?? followingWindow.items.count
-        FeedPerformance.log("Home memory warning: visible tab=\(tab) items=\(visibleCount)")
+        FeedPerformance.log("Home memory warning: tab=\(tab) logicalFeedCount=\(itemsForTab(tab).count)")
     }
 
     /// Main tab Home visible — reload default feed tab if UI is empty without an active load.
@@ -342,8 +219,7 @@ final class HomeViewModel {
         selectedFeedTabKey = HomeFeedTabKeys.huntToday
         items = []
         errorMessage = nil
-        followingWindow.reset(with: [])
-        followingItemIds = []
+        followingItemIds = followingStore.reset(with: [])
         followingNextCursor = nil
         followingHasMore = false
         followingDuplicatePageCount = 0
@@ -414,54 +290,11 @@ final class HomeViewModel {
     /// Bottom-nav re-tap / same-tab reselect — scroll to full header top (Android `requestScrollHomeToTop`).
     func requestScrollHomeToTop() {
         homeScrollToTopToken &+= 1
-        sectionTabTrimTask?.cancel()
-        // Suppress the compensator for 1.2s so any stale restore token cannot push the viewport
-        // back down after PinnedTabScrollOffsetFixer sets it to the true top.
-        homeFeedCompensatorSuppressedUntil = Date.now + 1.2
-        immediateRestoreCurrentSectionTabIfNeeded()
-    }
-
-    /// Called by blank-top detection when items exist but the masonry appears empty.
-    /// Forces a full grid relayout without touching item data.
-    func forceRepaintFeed() {
-        guard !items.isEmpty else { return }
-        homeFeedRepaintToken &+= 1
-    }
-
-    /// Called when the masonry layout rebuild detects blank chunks at visible positions.
-    /// First response: force a full relayout. The blank-top detector in HomeFeedScrollCoordinator
-    /// escalates to retryTab if the blank persists after the repaint settles.
-    func onFeedLayoutGapDetected(_ gaps: [FeedLayoutGap]) {
-        guard !gaps.isEmpty, !items.isEmpty else { return }
-        FeedPerformance.log("[HomeFeed] GapDetected → forceRepaintFeed gaps=\(gaps.count)")
-        forceRepaintFeed()
     }
 
     /// Horizontal swipe or different tab tap — align pinned tabs + first rows of that tab.
     func requestScrollHomeFeedToTop() {
         homeScrollToFeedTopToken &+= 1
-        sectionTabTrimTask?.cancel()
-        homeFeedCompensatorSuppressedUntil = Date.now + 1.2
-        immediateRestoreCurrentSectionTabIfNeeded()
-    }
-
-    /// Restore all front-trimmed items for the current section tab without applying scroll compensation.
-    /// Called on tab-bar tap-to-top and tab-switch so items 0..N are present before the scroll lands.
-    /// No `homeFeedTrimToken` increment → `FeedScrollTrimCompensator` does not fire.
-    private func immediateRestoreCurrentSectionTabIfNeeded() {
-        let tab = selectedFeedTab
-        guard tab != .following else { return }
-        var state = tabFeedState[tab.rawValue] ?? HomeTabFeedState()
-        guard state.window.logicalStartIndex > 0 else { return }
-        guard let restore = state.restoreFromGlobal(
-            targetGlobalStart: 0,
-            columnWidth: max(1, lastKnownFeedColumnWidth),
-            columnAssignments: [:]
-        ) else { return }
-        // Bidirectional: trim same count from back to keep window bounded.
-        state.trimBack(count: restore.addedCount)
-        tabFeedState[tab.rawValue] = state
-        syncItemsForSelectedTab()
     }
 
     func normalizeSelectedFeedTab(isGuestMode: Bool, deps: AppDependencies) {
@@ -752,7 +585,7 @@ final class HomeViewModel {
         lastFollowFeedLoadMoreAt = Date()
         isLoadingMoreFollowing = true
         let cursor = followingNextCursor
-        let offsetFallback = cursor == nil ? followingWindow.items.count : nil
+        let offsetFallback = cursor == nil ? followingStore.count : nil
         Task {
             defer { isLoadingMoreFollowing = false }
             let result = await FeedPerformance.measure("Home following loadMore cursor=\(cursor ?? "offset:\(offsetFallback ?? 0)")") {
@@ -773,7 +606,7 @@ final class HomeViewModel {
                 if selectedFeedTab == .following { syncItemsForSelectedTab() }
                 return
             }
-            let added = followingWindow.appendUnique(page.items, knownIds: &followingItemIds)
+            let added = followingStore.appendNew(page.items, knownIds: &followingItemIds)
             guard added > 0 else {
                 followingDuplicatePageCount += 1
                 if followingDuplicatePageCount >= 2 || page.items.isEmpty {
@@ -786,72 +619,8 @@ final class HomeViewModel {
             if selectedFeedTab == .following {
                 syncItemsForSelectedTab()
             }
-            FeedPerformance.log("Home following append +\(added) window=\(followingWindow.items.count) hasMore=\(followingHasMore)")
+            FeedPerformance.log("Home following append +\(added) total=\(followingStore.count) hasMore=\(followingHasMore)")
         }
-    }
-
-    /// Idle sliding-window trim for Following (pagination is footer-only at scroll bottom).
-    func notifyFollowingCellVisible(
-        index: Int,
-        columnWidth: CGFloat,
-        deps: AppDependencies,
-        isGuestMode: Bool
-    ) {
-        guard selectedFeedTab == .following else { return }
-        scheduleFollowingWindowTrimDeferred(visibleIndex: index, columnWidth: columnWidth)
-    }
-
-    private func adaptiveSectionTabPolicy(columnWidth: CGFloat) -> FeedSlidingWindowPolicy {
-        let vpH = UIScreen.main.bounds.height
-        let itemH = max(120, columnWidth * 1.2)
-        let itemsPerVP = max(4, Int(vpH / itemH * 2))
-        let maxItems = min(300, max(80, itemsPerVP * 6))
-        let buffer = max(24, itemsPerVP * 2)
-        let backfill = max(10, itemsPerVP)
-        return FeedSlidingWindowPolicy(
-            maxItems: maxItems,
-            bufferBefore: buffer,
-            bufferAfter: buffer,
-            backfillVisibleThreshold: backfill
-        )
-    }
-
-    private func scheduleFollowingWindowTrimDeferred(visibleIndex: Int, columnWidth: CGFloat, columnAssignments: [String: Bool] = [:]) {
-        followingTrimTask?.cancel()
-        followingTrimTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(320))
-            guard !Task.isCancelled else { return }
-            guard selectedFeedTab == .following else { return }
-            guard let boundary = homeScrollBoundary, !boundary.isUserInteracting else { return }
-            let assignments = columnAssignments
-            guard let trim = followingWindow.trimFrontIfNeeded(
-                visibleIndex: visibleIndex,
-                columnWidth: columnWidth,
-                policy: .homeFollowing,
-                columnAssignments: assignments
-            ) else { return }
-            syncItemsForSelectedTab()
-            homeFeedTrimSignedDeltaY = -trim.scrollDeltaY
-            homeFeedTrimToken += 1
-            FeedPerformance.log(
-                "Home following trim -\(trim.removedCount) window=\(followingWindow.items.count)"
-            )
-        }
-    }
-
-    /// @deprecated — pagination is footer-only; trim via [scheduleFollowingWindowTrim].
-    func requestLoadMoreFollowingIfNeeded(
-        appearedIndex: Int,
-        deps: AppDependencies,
-        isGuestMode: Bool
-    ) {
-        guard selectedFeedTab == .following else { return }
-        guard !isShellLoading, !isRefreshing, !isTabLoading(.following) else { return }
-        guard FeedPaginationPolicy.shouldPrefetchNextPage(
-            appearedIndex: appearedIndex,
-            totalCount: followingWindow.items.count
-        ) else { return }
-        loadMoreFollowing(deps: deps, isGuestMode: isGuestMode)
     }
 
     /// Brand footer only when the active tab finished loading and has no more pages.
@@ -973,15 +742,10 @@ final class HomeViewModel {
         loadedTabs.removeAll()
         recommendationSectionsFetched = false
         sections = HomeRecommendationSections()
-        followingWindow.reset(with: [])
-        followingItemIds = []
+        followingItemIds = followingStore.reset(with: [])
         followingNextCursor = nil
         followingHasMore = false
         followingDuplicatePageCount = 0
-        followingTrimTask?.cancel()
-        followingTrimTask = nil
-        sectionTabTrimTask?.cancel()
-        sectionTabTrimTask = nil
         tabFeedState = [:]
         sectionLoadMoreTasks.values.forEach { $0.cancel() }
         sectionLoadMoreTasks = [:]
@@ -1359,7 +1123,7 @@ final class HomeViewModel {
 
     private func loadFollowingTab(deps: AppDependencies, isGuestMode: Bool, force: Bool) async -> Bool {
         if isGuestMode { return true }
-        if !force && loadedTabs.contains(HomeFeedTabKeys.following) && !followingWindow.items.isEmpty { return true }
+        if !force && loadedTabs.contains(HomeFeedTabKeys.following) && !followingStore.isEmpty { return true }
         let result = await FeedPerformance.measure("Home following first page") {
             await fetchHomeFeedPageWithRetry(deps: deps, cursor: nil)
         }
@@ -1369,12 +1133,11 @@ final class HomeViewModel {
             }
             return false
         }
-        followingWindow.reset(with: page.items)
-        followingItemIds = Set(page.items.map(\.id))
+        followingItemIds = followingStore.reset(with: page.items)
         followingNextCursor = page.nextCursor
         followingHasMore = page.hasMore
         if selectedFeedTab == .following { syncItemsForSelectedTab() }
-        FeedPerformance.log("Home following items=\(followingWindow.items.count) hasMore=\(followingHasMore)")
+        FeedPerformance.log("Home following items=\(followingStore.count) hasMore=\(followingHasMore)")
         return true
     }
 
@@ -1522,7 +1285,7 @@ final class HomeViewModel {
     }
 
     private func itemsForTab(_ tab: HomeFeedTab) -> [ListingFeedItem] {
-        if tab == .following { return followingWindow.items }
+        if tab == .following { return followingStore.allItems }
         return tabFeedState[tab.rawValue]?.items ?? []
     }
 
@@ -1627,8 +1390,8 @@ final class HomeViewModel {
     }
 
     private func patchListingInFeeds(_ id: String, transform: (ListingFeedItem) -> ListingFeedItem) {
-        // O(1) in-place patch through each tab's window — avoids full O(n) array maps.
-        followingWindow.patchItem(withId: id, transform: transform)
+        // O(1) in-place patch through each tab's store — avoids full O(n) array maps.
+        followingStore.patchItem(withId: id, transform: transform)
         for tab in HomeFeedTab.allCases where tab != .following {
             guard var state = tabFeedState[tab.rawValue] else { continue }
             state.patchItem(withId: id, transform: transform)
