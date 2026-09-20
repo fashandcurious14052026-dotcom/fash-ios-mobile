@@ -202,22 +202,24 @@ final class HomeFeedScrollBoundary {
     }
 
     func updateHomeStickyTabsVisibility(headerHeight: CGFloat, tabRowHeight: CGFloat) {
-        if stickyForceHidden {
-            if contentOffsetY <= 24 {
-                stickyForceHidden = false
-            } else {
-                if stickyTabsVisible {
-                    stickyTabsVisible = false
-                }
-                stickyTabsLatch = false
-                return
-            }
-        }
-
         let chromeHeight = max(headerHeight, 0) + max(tabRowHeight, 44)
         let pinThreshold = max(chromeHeight - 6, 72)
         let unpinThreshold = max(pinThreshold - 36, 12)
         let offset = max(0, contentOffsetY)
+
+        if stickyForceHidden {
+            // Reset when:
+            //   (a) scroll returned to the top — tap-to-top animation completed, OR
+            //   (b) scroll passed the header — user scrolled through the header zone
+            //       and sticky tabs must be visible again (deep-scroll guest tab bug fix).
+            if contentOffsetY <= 24 || offset >= pinThreshold {
+                stickyForceHidden = false
+            } else {
+                if stickyTabsVisible { stickyTabsVisible = false }
+                stickyTabsLatch = false
+                return
+            }
+        }
 
         if isAtTop || offset <= unpinThreshold {
             stickyTabsLatch = false
