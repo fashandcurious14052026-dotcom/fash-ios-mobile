@@ -10,6 +10,9 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
     var isLoadingTop: Bool = false
     /// Incremented externally to force a full relayout even if itemsSignature is unchanged.
     var repaintToken: Int = 0
+    /// Called post-mutation when the layout rebuild finds blank chunks at visible positions.
+    /// Never fired on scroll events; only after trim/restore/replace mutations settle.
+    var onGapDetected: (([FeedLayoutGap]) -> Void)? = nil
     @ViewBuilder var footer: () -> Footer
     @ViewBuilder let cell: (ListingFeedItem, Int) -> Cell
 
@@ -49,6 +52,7 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
         chunkSize: Int = ListingMasonryFeedPages.profileChunkPageSize,
         isLoadingTop: Bool = false,
         repaintToken: Int = 0,
+        onGapDetected: (([FeedLayoutGap]) -> Void)? = nil,
         @ViewBuilder footer: @escaping () -> Footer = { EmptyView() },
         @ViewBuilder cell: @escaping (ListingFeedItem, Int) -> Cell
     ) {
@@ -57,6 +61,7 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
         self.chunkSize = chunkSize
         self.isLoadingTop = isLoadingTop
         self.repaintToken = repaintToken
+        self.onGapDetected = onGapDetected
         self.footer = footer
         self.cell = cell
     }
@@ -94,6 +99,10 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
             if new.count > old.count && new.firstId == old.firstId {
                 refreshLayout(forceFull: false)
             } else {
+                // firstId changed (front-trim, restore, or replace): clear stale perChunkLayout
+                // immediately so chunks fall back to chunkFallbackColumns (correct current items)
+                // instead of rendering wrong items from the previous column assignment.
+                perChunkLayout = [:]
                 refreshLayout(forceFull: true)
             }
         }
@@ -254,6 +263,37 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
             )
         }
         perChunkLayout = result
+        validateLayoutGaps(chunks: chunks, perChunkLayout: result)
+    }
+
+    // O(visibleChunks) gap check — only inspects first 3 chunks (the viewport-visible zone).
+    // Fires onGapDetected if items exist but visible chunks have empty columns.
+    private func validateLayoutGaps(
+        chunks: [ListingMasonryFeedPages.FeedOrderChunk],
+        perChunkLayout: [Int: ChunkColumns]
+    ) {
+        guard let onGapDetected, !items.isEmpty else { return }
+        let visibleChunks = chunks.prefix(3)
+        var gaps: [FeedLayoutGap] = []
+        for chunk in visibleChunks {
+            guard let cols = perChunkLayout[chunk.id] else { continue }
+            let leftEmpty = cols.left.isEmpty
+            let rightEmpty = cols.right.isEmpty
+            guard leftEmpty || rightEmpty else { continue }
+            let neighborIds = chunk.entries.prefix(4).map { $0.item.id }
+            gaps.append(FeedLayoutGap(
+                chunkIndex: chunk.id,
+                column: leftEmpty && !rightEmpty ? false : (rightEmpty && !leftEmpty ? true : nil),
+                neighboringItemIds: Array(neighborIds),
+                reason: leftEmpty && rightEmpty ? "empty_chunk" : "empty_column",
+                confidence: leftEmpty && rightEmpty ? 1.0 : 0.7,
+                isSafeForFallback: true
+            ))
+        }
+        if !gaps.isEmpty {
+            FeedPerformance.log("[HomeFeed] GapDetected count=\(gaps.count) chunks=\(gaps.map(\.chunkIndex))")
+            onGapDetected(gaps)
+        }
     }
 
 }
@@ -265,6 +305,7 @@ extension FeedMasonryChunkedGrid where Footer == EmptyView {
         chunkSize: Int = ListingMasonryFeedPages.profileChunkPageSize,
         isLoadingTop: Bool = false,
         repaintToken: Int = 0,
+        onGapDetected: (([FeedLayoutGap]) -> Void)? = nil,
         @ViewBuilder cell: @escaping (ListingFeedItem, Int) -> Cell
     ) {
         self.init(
@@ -273,6 +314,7 @@ extension FeedMasonryChunkedGrid where Footer == EmptyView {
             chunkSize: chunkSize,
             isLoadingTop: isLoadingTop,
             repaintToken: repaintToken,
+            onGapDetected: onGapDetected,
             footer: { EmptyView() },
             cell: cell
         )

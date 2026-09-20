@@ -150,7 +150,8 @@ struct HomeFeedContent: View {
                             )
                             FeedScrollTrimCompensator(
                                 token: viewModel.homeFeedTrimToken,
-                                signedDeltaY: viewModel.homeFeedTrimSignedDeltaY
+                                signedDeltaY: viewModel.homeFeedTrimSignedDeltaY,
+                                suppressUntil: viewModel.homeFeedCompensatorSuppressedUntil
                             )
                         }
                     }
@@ -354,6 +355,9 @@ struct HomeFeedContent: View {
                     columnAssignments: masonryColumnAssignments,
                     isLoadingTop: viewModel.homeFeedTopLoading,
                     repaintToken: viewModel.homeFeedRepaintToken,
+                    onGapDetected: { gaps in
+                        viewModel.onFeedLayoutGapDetected(gaps)
+                    },
                     footer: {
                         let tab = viewModel.selectedFeedTab
                         if viewModel.hasMore(for: tab) || viewModel.isLoadingMore(for: tab) {

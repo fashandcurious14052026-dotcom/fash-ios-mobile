@@ -116,6 +116,8 @@ final class HomeViewModel {
     var homeFeedTopLoading = false
     /// Incremented when blank-top detection fires — forces the masonry grid to relayout from scratch.
     var homeFeedRepaintToken = 0
+    /// Non-nil during the tap-to-top suppression window — tells FeedScrollTrimCompensator to skip.
+    var homeFeedCompensatorSuppressedUntil: Date? = nil
     /// Last column width passed to scheduleSectionTabTrim — used for immediate scroll-to-top restore.
     private var lastKnownFeedColumnWidth: CGFloat = 160
 
@@ -413,6 +415,9 @@ final class HomeViewModel {
     func requestScrollHomeToTop() {
         homeScrollToTopToken &+= 1
         sectionTabTrimTask?.cancel()
+        // Suppress the compensator for 1.2s so any stale restore token cannot push the viewport
+        // back down after PinnedTabScrollOffsetFixer sets it to the true top.
+        homeFeedCompensatorSuppressedUntil = Date.now + 1.2
         immediateRestoreCurrentSectionTabIfNeeded()
     }
 
@@ -423,10 +428,20 @@ final class HomeViewModel {
         homeFeedRepaintToken &+= 1
     }
 
+    /// Called when the masonry layout rebuild detects blank chunks at visible positions.
+    /// First response: force a full relayout. The blank-top detector in HomeFeedScrollCoordinator
+    /// escalates to retryTab if the blank persists after the repaint settles.
+    func onFeedLayoutGapDetected(_ gaps: [FeedLayoutGap]) {
+        guard !gaps.isEmpty, !items.isEmpty else { return }
+        FeedPerformance.log("[HomeFeed] GapDetected → forceRepaintFeed gaps=\(gaps.count)")
+        forceRepaintFeed()
+    }
+
     /// Horizontal swipe or different tab tap — align pinned tabs + first rows of that tab.
     func requestScrollHomeFeedToTop() {
         homeScrollToFeedTopToken &+= 1
         sectionTabTrimTask?.cancel()
+        homeFeedCompensatorSuppressedUntil = Date.now + 1.2
         immediateRestoreCurrentSectionTabIfNeeded()
     }
 

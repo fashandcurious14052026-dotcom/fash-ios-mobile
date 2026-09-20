@@ -203,6 +203,8 @@ struct FeedScrollTrimCompensator: UIViewRepresentable {
     var token: Int
     /// Signed UIKit adjustment: negative = trim (scroll up), positive = prepend (scroll down).
     var signedDeltaY: CGFloat
+    /// When non-nil and in the future, all compensation is skipped (tap-to-top suppression window).
+    var suppressUntil: Date? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -214,6 +216,7 @@ struct FeedScrollTrimCompensator: UIViewRepresentable {
 
     func updateUIView(_ uiView: AnchorView, context: Context) {
         uiView.coordinator = context.coordinator
+        context.coordinator.suppressUntil = suppressUntil
         guard token > 0, token != context.coordinator.lastToken else { return }
         context.coordinator.lastToken = token
         uiView.applyCompensation(signedDeltaY: signedDeltaY)
@@ -221,6 +224,7 @@ struct FeedScrollTrimCompensator: UIViewRepresentable {
 
     final class Coordinator {
         var lastToken = 0
+        var suppressUntil: Date?
     }
 
     final class AnchorView: UIView {
@@ -234,12 +238,12 @@ struct FeedScrollTrimCompensator: UIViewRepresentable {
 
         private func applyCompensationNow(signedDeltaY: CGFloat) {
             guard abs(signedDeltaY) > 0.5, let scrollView = enclosingScrollView() else { return }
+            // Suppress during the tap-to-top window so a stale restore token cannot push
+            // the viewport back down after requestScrollHomeToTop set it to the true top.
+            if let sup = coordinator?.suppressUntil, Date.now < sup { return }
             scrollView.layoutIfNeeded()
             let minY = -scrollView.adjustedContentInset.top
-            // Safety net: when a prepend/restore fires (positive delta) but the viewport is already
-            // at or near the top (e.g. a stale token after tab-bar tap-to-top), skip the push-down.
-            // immediateRestoreCurrentSectionTabIfNeeded() is the primary path that prevents this;
-            // this guard covers any race where a delayed token still reaches the compensator.
+            // Safety net: skip positive-delta compensation when already at or near the top.
             if signedDeltaY > 0, scrollView.contentOffset.y <= minY + 150 { return }
             var offset = scrollView.contentOffset
             offset.y = max(minY, offset.y + signedDeltaY)
