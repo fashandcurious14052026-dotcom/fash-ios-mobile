@@ -112,6 +112,16 @@ struct FeedMasonryLayout {
         return result
     }
 
+    /// True when every placement still describes `items[index]` — i.e. `items` grew by appending only.
+    /// O(count) id comparisons; only evaluated when a view body runs, never per scroll frame.
+    func matchesPrefix(of items: [ListingFeedItem]) -> Bool {
+        guard placements.count <= items.count else { return false }
+        for placement in placements where items[placement.index].id != placement.id {
+            return false
+        }
+        return true
+    }
+
     /// Structural invariants that must hold before a layout may be committed for rendering.
     /// Returns human-readable issues; empty means valid.
     func validate(against items: [ListingFeedItem]) -> [String] {
@@ -165,8 +175,6 @@ final class FeedMasonryLayoutStore {
 
     private(set) var layout: FeedMasonryLayout = .empty
     private(set) var lastTransition: Transition = .unchanged
-    private var firstId: String?
-    private var lastId: String?
     private var generation = 0
 
     /// Resolve the layout for `items`. Append-only growth extends the existing layout in O(new);
@@ -175,8 +183,6 @@ final class FeedMasonryLayoutStore {
         guard !items.isEmpty, metrics.columnWidth > 0 else {
             if !layout.isEmpty {
                 layout = .empty
-                firstId = nil
-                lastId = nil
                 lastTransition = .cleared
             } else {
                 lastTransition = .unchanged
@@ -184,11 +190,11 @@ final class FeedMasonryLayoutStore {
             return layout
         }
 
+        // Full id-prefix comparison: a refresh that keeps the first and last ids but reorders the
+        // middle must rebuild, otherwise the tile id guard would drop the mismatched cells.
         let prefixUnchanged = layout.metrics == metrics
             && !layout.isEmpty
-            && layout.count <= items.count
-            && firstId == items.first?.id
-            && lastId == items[layout.count - 1].id
+            && layout.matchesPrefix(of: items)
 
         if prefixUnchanged && layout.count == items.count {
             lastTransition = .unchanged
@@ -218,8 +224,6 @@ final class FeedMasonryLayoutStore {
             return
         }
         layout = candidate
-        firstId = items.first?.id
-        lastId = items[candidate.count - 1].id
         lastTransition = transition
         FeedPerformance.log(
             "[HomeFeed] layout \(transition.rawValue) gen=\(candidate.generation) items=\(items.count) "
