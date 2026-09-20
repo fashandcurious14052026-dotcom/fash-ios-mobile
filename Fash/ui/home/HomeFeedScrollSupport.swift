@@ -393,15 +393,21 @@ struct HomeFeedScrollCoordinator: UIViewRepresentable {
                     tabRowHeight: homeTabRowHeight
                 )
                 // Blank-top safety net: PinnedTabScrollOffsetFixer retries for 600ms total.
-                // Check at 750ms — if items exist but contentSize is unreasonably small, the
-                // masonry didn't render. Fire forceRepaintFeed() to rebuild the grid layout.
+                // Check at 750ms — two signals indicate a blank top:
+                //   1. scroll ended up more than 50pt below the true top (compensator pushed it down)
+                //   2. contentSize is unreasonably small for the item count (masonry didn't render)
+                // Either signal triggers a full tab reload to clear the stuck state.
                 let capturedItemCount = itemCount
                 let capturedCallback = onBlankTopDetected
                 guard capturedItemCount > 5, capturedCallback != nil else { return }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak scrollView] in
-                    guard let scrollView else { return }
-                    let minExpected = max(400, scrollView.bounds.height * 0.8)
-                    guard scrollView.contentSize.height < minExpected else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self, weak scrollView] in
+                    guard let self, let scrollView else { return }
+                    guard !self.boundary.isUserInteracting else { return }
+                    guard capturedItemCount > 5 else { return }
+                    let minY = -scrollView.adjustedContentInset.top
+                    let scrollNotAtTop = scrollView.contentOffset.y > minY + 50
+                    let contentTooSmall = scrollView.contentSize.height < max(400, scrollView.bounds.height * 0.8)
+                    guard scrollNotAtTop || contentTooSmall else { return }
                     capturedCallback?()
                 }
             }

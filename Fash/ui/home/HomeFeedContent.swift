@@ -138,7 +138,15 @@ struct HomeFeedContent: View {
                                 homeHeaderHeight: homeHeaderHeight,
                                 homeTabRowHeight: homeTabRowHeight,
                                 itemCount: viewModel.items.count,
-                                onBlankTopDetected: { viewModel.forceRepaintFeed() }
+                                onBlankTopDetected: {
+                                    // Blank detected at top after scroll settled — reload the tab
+                                    // from the API to clear any stuck scroll/layout state.
+                                    viewModel.retryTab(
+                                        viewModel.selectedFeedTab,
+                                        deps: deps,
+                                        isGuestMode: isGuestMode
+                                    )
+                                }
                             )
                             FeedScrollTrimCompensator(
                                 token: viewModel.homeFeedTrimToken,
