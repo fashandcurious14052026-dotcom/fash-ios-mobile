@@ -13,6 +13,9 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
     /// Called post-mutation when the layout rebuild finds blank chunks at visible positions.
     /// Never fired on scroll events; only after trim/restore/replace mutations settle.
     var onGapDetected: (([FeedLayoutGap]) -> Void)? = nil
+    /// When set, the first chunk reports its minY via `HomeFeedFirstContentMinYKey` in this
+    /// named coordinate space. Used by the Home tab gap anchor system — do not set on profile grids.
+    var coordinateSpaceForFirstContent: String? = nil
     @ViewBuilder var footer: () -> Footer
     @ViewBuilder let cell: (ListingFeedItem, Int) -> Cell
 
@@ -53,6 +56,7 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
         isLoadingTop: Bool = false,
         repaintToken: Int = 0,
         onGapDetected: (([FeedLayoutGap]) -> Void)? = nil,
+        coordinateSpaceForFirstContent: String? = nil,
         @ViewBuilder footer: @escaping () -> Footer = { EmptyView() },
         @ViewBuilder cell: @escaping (ListingFeedItem, Int) -> Cell
     ) {
@@ -62,6 +66,7 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
         self.isLoadingTop = isLoadingTop
         self.repaintToken = repaintToken
         self.onGapDetected = onGapDetected
+        self.coordinateSpaceForFirstContent = coordinateSpaceForFirstContent
         self.footer = footer
         self.cell = cell
     }
@@ -145,6 +150,19 @@ struct FeedMasonryChunkedGrid<Cell: View, Footer: View>: View {
         }
         .padding(.leading, spacing.editorialStart)
         .padding(.trailing, spacing.editorialEnd)
+        // Report first chunk position for the Home tab gap anchor system.
+        // Background GeometryReader is zero-size — no layout impact.
+        .background {
+            if chunk.id == 0, let space = coordinateSpaceForFirstContent {
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: HomeFeedFirstContentMinYKey.self,
+                        value: geo.frame(in: .named(space)).minY
+                    )
+                }
+                .allowsHitTesting(false)
+            }
+        }
     }
 
     private func chunkFallbackColumns(_ chunk: ListingMasonryFeedPages.FeedOrderChunk) -> ChunkColumns {
@@ -306,6 +324,7 @@ extension FeedMasonryChunkedGrid where Footer == EmptyView {
         isLoadingTop: Bool = false,
         repaintToken: Int = 0,
         onGapDetected: (([FeedLayoutGap]) -> Void)? = nil,
+        coordinateSpaceForFirstContent: String? = nil,
         @ViewBuilder cell: @escaping (ListingFeedItem, Int) -> Cell
     ) {
         self.init(
@@ -315,6 +334,7 @@ extension FeedMasonryChunkedGrid where Footer == EmptyView {
             isLoadingTop: isLoadingTop,
             repaintToken: repaintToken,
             onGapDetected: onGapDetected,
+            coordinateSpaceForFirstContent: coordinateSpaceForFirstContent,
             footer: { EmptyView() },
             cell: cell
         )
