@@ -16,11 +16,10 @@ struct ListingGridCard: View, Equatable {
     var onLike: (() -> Void)? = nil
     var onSave: (() -> Void)? = nil
     
-    // Equatable conformance: compare only data properties, ignore closures
+    // Equatable conformance: compare data properties only, ignore closures. The whole item is compared
+    // so any in-place patch (like/save counts, status, title) still re-renders the card.
     static func == (lhs: ListingGridCard, rhs: ListingGridCard) -> Bool {
-        lhs.item.id == rhs.item.id &&
-        lhs.item.isLiked == rhs.item.isLiked &&
-        lhs.item.isSaved == rhs.item.isSaved &&
+        lhs.item == rhs.item &&
         lhs.imageAspectRatio == rhs.imageAspectRatio &&
         lhs.compactFooter == rhs.compactFooter &&
         lhs.showQuickActions == rhs.showQuickActions &&

@@ -7,23 +7,6 @@ enum HomeScrollIds {
     static let feedContent = "home_feed_content"
 }
 
-struct HomeFeedScrollOffsetKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-/// In-scroll tab row minY — when < 0 the row scrolled off; show Android-style sticky overlay.
-struct HomeTabRowMinYKey: PreferenceKey {
-    static var defaultValue: CGFloat = .infinity
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = min(value, nextValue())
-    }
-}
-
 struct HomeTabRowHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 48
 
@@ -33,36 +16,24 @@ struct HomeTabRowHeightKey: PreferenceKey {
     }
 }
 
+/// Scroll-to-top target. Scroll offset itself is observed on the `UIScrollView` by
+/// `HomeFeedScrollCoordinator`; no per-frame SwiftUI preference is emitted from here.
 struct HomeFeedScrollOffsetAnchor: View {
     var body: some View {
         Color.clear
             .frame(height: 0)
             .id(HomeScrollIds.top)
-            .homeFeedScrollOffsetReporting()
     }
 }
 
 extension View {
-    func homeFeedScrollOffsetReporting(space: String = "homeFeedScroll") -> some View {
-        background {
-            GeometryReader { geo in
-                Color.clear.preference(
-                    key: HomeFeedScrollOffsetKey.self,
-                    value: geo.frame(in: .named(space)).minY
-                )
-            }
-            .allowsHitTesting(false)
-        }
-    }
-
-    func homeTabRowScrollReporting(space: String = "homeFeedScroll") -> some View {
+    /// Reports the in-scroll tab row height only. The row's minY is intentionally not reported — sticky
+    /// tab visibility is driven by the UIKit content offset, and a frame-based preference here would
+    /// re-run the preference pass on every scroll frame with nobody consuming it.
+    func homeTabRowScrollReporting() -> some View {
         background {
             GeometryReader { geo in
                 Color.clear
-                    .preference(
-                        key: HomeTabRowMinYKey.self,
-                        value: geo.frame(in: .named(space)).minY
-                    )
                     .preference(key: HomeTabRowHeightKey.self, value: geo.size.height)
             }
             .allowsHitTesting(false)
@@ -182,6 +153,11 @@ final class HomeFeedScrollBoundary {
     private(set) var contentOffsetY: CGFloat = 0
     /// True when in-scroll tab row scrolled off — drives pinned tab overlay.
     private(set) var stickyTabsVisible = false
+    /// True from the first content-offset change until the scroll has been still for
+    /// `scrollIdleDelayMs`. Feed cells suspend decorative animation (marquees) while this is set.
+    private(set) var isScrollActive = false
+
+    static let scrollIdleDelayMs = 200
 
     private var stickyTabsLatch = false
     private var stickyForceHidden = false
@@ -256,6 +232,7 @@ final class HomeFeedScrollBoundary {
         if isUserInteracting != self.isUserInteracting { self.isUserInteracting = isUserInteracting }
         if abs(contentOffsetY - self.contentOffsetY) > 0.5 {
             self.contentOffsetY = contentOffsetY
+            if !isScrollActive { isScrollActive = true }
         }
         if abs(deltaY) > 3.5 {
             if deltaY < 0 {
@@ -268,6 +245,7 @@ final class HomeFeedScrollBoundary {
     }
 
     fileprivate func clearScrollingUpIfIdle() {
+        if isScrollActive { isScrollActive = false }
         guard isScrollingUp else { return }
         // Release when back at top, or when user scrolled up away from the pagination zone.
         if isAtTop || !isNearBottom {
@@ -333,14 +311,23 @@ struct HomeFeedScrollCoordinator: UIViewRepresentable {
             reportBoundary(on: scrollView, deltaY: 0)
 
             offsetObservation = scrollView.observe(\.contentOffset, options: [.new]) { [weak self] sv, _ in
-                Task { @MainActor in
-                    guard let self else { return }
-                    let y = sv.contentOffset.y
-                    let delta = y - (self.lastContentOffsetY ?? y)
-                    self.lastContentOffsetY = y
-                    self.reportBoundary(on: sv, deltaY: delta)
+                // UIScrollView mutates contentOffset on the main thread, so the KVO callback is already
+                // main-isolated. Handling it inline avoids one Task allocation + run-loop hop per scroll
+                // frame and keeps boundary state in the same frame as the offset change.
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { self?.handleOffsetChange(on: sv) }
+                } else {
+                    Task { @MainActor in self?.handleOffsetChange(on: sv) }
                 }
             }
+        }
+
+        @MainActor
+        private func handleOffsetChange(on scrollView: UIScrollView) {
+            let y = scrollView.contentOffset.y
+            let delta = y - (lastContentOffsetY ?? y)
+            lastContentOffsetY = y
+            reportBoundary(on: scrollView, deltaY: delta)
         }
 
         @MainActor
@@ -363,7 +350,7 @@ struct HomeFeedScrollCoordinator: UIViewRepresentable {
             )
             scrollIdleTask?.cancel()
             scrollIdleTask = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(200))
+                try? await Task.sleep(for: .milliseconds(HomeFeedScrollBoundary.scrollIdleDelayMs))
                 guard !Task.isCancelled else { return }
                 boundary.clearScrollingUpIfIdle()
             }

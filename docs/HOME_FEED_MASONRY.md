@@ -67,6 +67,24 @@ The pagination footer joins the hierarchy only while the band reaches the end of
 * Grid subtree: `.id(selectedFeedTabKey)` so each tab owns its own layout store and band.
 * Image state transitions never touch identity or geometry.
 
+## Scroll-time budget (build 395)
+
+Per-frame work while the feed scrolls is limited to the UIKit `contentOffset` KVO in
+`HomeFeedScrollCoordinator` / `FashFeedPullRefreshHost` (handled inline on the main thread, no Task hop)
+and the single grid `GeometryReader` that emits the render band. Everything else is gated:
+
+* **Marquees pause while scrolling.** `HomeFeedScrollBoundary.isScrollActive` is true from the first
+  offset change until the scroll has been still for 200 ms. `HomeFeedScrollActivityGate` publishes it as
+  `\.fashMarqueeSuspended`; every `FashMarqueeText` in the band shows its static label and runs no
+  animation until the scroll settles (then resumes after its normal initial delay). A card has up to four
+  marquees and the band holds ~20 cards, so this removes dozens of concurrent animations from each frame.
+* **No dead preferences.** The scroll-offset anchor and the in-scroll tab row emit no frame-based
+  preference; only the tab row height is reported. Sticky tabs are driven by the UIKit offset.
+* **Cell bodies are cheap and skippable.** `FeedPriceFormat` caches its `NumberFormatter` per language
+  tag (it used to allocate one per card body, twice per card); `ListingGridCard` is wrapped in
+  `.equatable()` so pagination appends do not re-run bodies of unchanged cards.
+* Only the fixed sticky tab overlay carries a shadow; the moving in-scroll copy does not.
+
 ## Instrumentation (`FEED_PERF_LOG=1`)
 
 ```

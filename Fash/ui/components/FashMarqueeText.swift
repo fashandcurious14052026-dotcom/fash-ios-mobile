@@ -1,7 +1,22 @@
 import SwiftUI
 
+private struct FashMarqueeSuspendedKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    /// True while the enclosing feed is actively scrolling. Marquees show their static label and run no
+    /// animation, so dozens of off-screen ticker animations never compete with the scroll for frame time.
+    /// They resume (after their initial delay) once the scroll settles.
+    var fashMarqueeSuspended: Bool {
+        get { self[FashMarqueeSuspendedKey.self] }
+        set { self[FashMarqueeSuspendedKey.self] = newValue }
+    }
+}
+
 /// Horizontal marquee when label overflows — Android `basicMarquee`.
 struct FashMarqueeText: View {
+    @Environment(\.fashMarqueeSuspended) private var suspended
     let text: String
     var font: Font = FashTypography.bodySmall
     var fontWeight: Font.Weight = .regular
@@ -20,7 +35,7 @@ struct FashMarqueeText: View {
     @State private var marqueeTask: Task<Void, Never>?
 
     private var overflow: CGFloat { max(0, textWidth - containerWidth) }
-    private var shouldScroll: Bool { overflow > 1 && !text.isEmpty && containerWidth > 1 }
+    private var shouldScroll: Bool { !suspended && overflow > 1 && !text.isEmpty && containerWidth > 1 }
     private var loopTravel: CGFloat {
         continuousLoop ? textWidth + segmentGap : overflow
     }
@@ -68,6 +83,17 @@ struct FashMarqueeText: View {
             }
             .onChange(of: text) { _, _ in
                 restartMarquee()
+            }
+            .onChange(of: suspended) { _, isSuspended in
+                if isSuspended {
+                    marqueeTask?.cancel()
+                    marqueeTask = nil
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) { offset = 0 }
+                } else {
+                    restartMarquee()
+                }
             }
             .onDisappear {
                 marqueeTask?.cancel()

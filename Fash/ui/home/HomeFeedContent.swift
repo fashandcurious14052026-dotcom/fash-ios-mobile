@@ -93,10 +93,14 @@ struct HomeFeedContent: View {
                                 .id(HomeScrollIds.pinnedTabs)
                                 .homeTabRowScrollReporting()
 
-                            feedBodyContent
-                                .id(HomeScrollIds.feedContent)
-                                .allowsHitTesting(listingInteractionEnabled)
-                                .frame(minHeight: homeFeedMinHeight, alignment: .top)
+                            // Marquee suspension is applied by a tiny wrapper so the scroll-active
+                            // toggle re-renders only the feed subtree, not the header/tab chrome.
+                            HomeFeedScrollActivityGate(boundary: homeScrollBoundary) {
+                                feedBodyContent
+                            }
+                            .id(HomeScrollIds.feedContent)
+                            .allowsHitTesting(listingInteractionEnabled)
+                            .frame(minHeight: homeFeedMinHeight, alignment: .top)
                         }
                         .padding(.bottom, promoDockInset + spacing.spacing2)
                         .fashScrollViewTabSwipe(
@@ -263,8 +267,9 @@ struct HomeFeedContent: View {
     }
 
     /// Tab row — in-scroll copy; sticky overlay shown separately when scrolled off (Android parity).
+    @ViewBuilder
     private func homeFeedTabsBar(sticky: Bool) -> some View {
-        VStack(spacing: 0) {
+        let bar = VStack(spacing: 0) {
             HomeFeedTabSwitcher(
                 tabs: tabs,
                 selectedTab: viewModel.selectedFeedTab,
@@ -278,7 +283,14 @@ struct HomeFeedContent: View {
                 .overlay(FashColors.outlineMuted.opacity(0.35))
         }
         .background(FashColors.screen)
-        .shadow(color: sticky ? Color.black.opacity(0.08) : .clear, radius: 3, y: 1)
+
+        // The in-scroll copy moves every frame; a shadow filter (even a clear one) forces an offscreen
+        // render pass for it, so only the fixed sticky overlay gets the shadow.
+        if sticky {
+            bar.shadow(color: Color.black.opacity(0.08), radius: 3, y: 1)
+        } else {
+            bar
+        }
     }
 
     @ViewBuilder
@@ -452,6 +464,18 @@ struct HomeFeedContent: View {
     }
 }
 
+/// Publishes `\.fashMarqueeSuspended` from the UIKit scroll boundary. Kept as its own view so the
+/// scroll-active toggle (twice per gesture) invalidates only this subtree.
+private struct HomeFeedScrollActivityGate<Content: View>: View {
+    var boundary: HomeFeedScrollBoundary
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        content()
+            .environment(\.fashMarqueeSuspended, boundary.isScrollActive)
+    }
+}
+
 private struct HomeFeedListingCell: View {
     let item: ListingFeedItem
     let index: Int
@@ -477,6 +501,9 @@ private struct HomeFeedListingCell: View {
             onLike: onLike,
             onSave: onSave
         )
+        // Pagination appends re-run the grid body for every visible cell; the card compares its data
+        // fields (not closures) so unchanged cards skip their body entirely.
+        .equatable()
         .onAppear {
             appearedAt = Date()
             recordViewTask?.cancel()

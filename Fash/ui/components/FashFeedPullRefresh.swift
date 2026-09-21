@@ -157,8 +157,11 @@ private struct FashFeedPullRefreshHost: UIViewRepresentable {
             scrollView.refreshControl = nil
 
             offsetObservation = scrollView.observe(\.contentOffset, options: [.new]) { [weak self] sv, _ in
-                Task { @MainActor in
-                    self?.handleContentOffsetChange(sv)
+                // Already on the main thread for UIScrollView offset changes — skip the per-frame Task hop.
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { self?.handleContentOffsetChange(sv) }
+                } else {
+                    Task { @MainActor in self?.handleContentOffsetChange(sv) }
                 }
             }
         }
