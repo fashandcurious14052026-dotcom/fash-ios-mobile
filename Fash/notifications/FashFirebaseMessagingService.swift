@@ -93,6 +93,18 @@ enum FashFirebaseMessagingService {
                routeDeepLink(deepLink, deps: deps) {
                 return
             }
+            // Types flagged in NotificationNavigationPolicy (currently chat + recommendations
+            // carrying a listing) skip the generic inbox/notification-detail screen entirely,
+            // even when the payload also carries a ledger id — add new direct types there.
+            if let router = deps.navigationRouter, let target = NotificationNavigationPolicy.resolve(data) {
+                switch target {
+                case .chat(let conversationId):
+                    InAppNotificationNavigation.openChat(conversationId: conversationId, router: router, deps: deps)
+                case .listing(let listingId):
+                    deps.presentListingDetail(listingId: listingId, router: router)
+                }
+                return
+            }
             let nav = data["nav_target"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 ?? data["navTarget"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 ?? ""
